@@ -64,7 +64,7 @@ jobs:
           python harness/ci/audit.py --run-id "$RUN_ID" --mode "$MODE" --logs logs.zip --report report.json "${source[@]}"
       - name: Seal the audit report
         if: always()
-        run: python harness/ci/seal.py --name "audit-$RUN_ID" --output sealed --base . report.json
+        run: python harness/ci/seal.py --name "audit-$RUN_ID" --output sealed --base . report.json logs.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with: {name: audit-sealed, path: sealed/*.age, retention-days: 7, if-no-files-found: warn}

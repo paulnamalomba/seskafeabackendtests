@@ -96,7 +96,8 @@ jobs:
         if: env.MODE == 'qualify' && env.TIER != 'stack'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ runner.temp }}/reference.tar.xz.age
+          path: exchange/reference.tar.xz.age
+          enableCrossOsArchive: true
           key: ${{ steps.keys.outputs.reference_key }}
           restore-keys: ${{ steps.keys.outputs.reference_fallback }}
       - name: Dependencies, support tests and pinned provisioning
@@ -130,11 +131,11 @@ jobs:
         run: |
           python harness/ci/seal.py --name reference --recipient-file harness/ci/exchange.recipient --output "$RUNNER_TEMP/reference-out" \
             --base backend/artifacts/qualification regression mumps validation.json
-          mv "$RUNNER_TEMP/reference-out/reference.tar.xz.age" "$RUNNER_TEMP/reference.tar.xz.age"
+          mkdir -p exchange && mv "$RUNNER_TEMP/reference-out/reference.tar.xz.age" exchange/reference.tar.xz.age
       - name: Keep the reference
         if: success() && steps.provision.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with: {path: '${{ runner.temp }}/reference.tar.xz.age', key: '${{ steps.keys.outputs.reference_key }}'}
+        with: {path: exchange/reference.tar.xz.age, key: '${{ steps.keys.outputs.reference_key }}', enableCrossOsArchive: true}
       - name: Seal outputs (summaries, hashes and logs)
         if: success()
         run: |
@@ -199,14 +200,15 @@ jobs:
         if: env.MODE == 'qualify'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ runner.temp }}/reference.tar.xz.age
+          path: exchange/reference.tar.xz.age
+          enableCrossOsArchive: true
           key: ${{ steps.keys.outputs.reference_key }}
           restore-keys: ${{ steps.keys.outputs.reference_fallback }}
           fail-on-cache-miss: true
       - name: Decrypt the reference
         if: env.MODE == 'qualify'
         env: {EXCHANGE_IDENTITY: '${{ secrets.EXCHANGE_IDENTITY }}'}
-        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input "$env:RUNNER_TEMP/reference.tar.xz.age" --output "$env:RUNNER_TEMP/reference"
+        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input exchange/reference.tar.xz.age --output "$env:RUNNER_TEMP/reference"
       - name: Dependencies and pinned toolchain
         if: env.MODE == 'qualify'
         run: |
@@ -310,14 +312,15 @@ jobs:
         if: env.MODE == 'qualify'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ${{ runner.temp }}/reference.tar.xz.age
+          path: exchange/reference.tar.xz.age
+          enableCrossOsArchive: true
           key: ${{ steps.keys.outputs.reference_key }}
           restore-keys: ${{ steps.keys.outputs.reference_fallback }}
           fail-on-cache-miss: true
       - name: Decrypt the reference
         if: env.MODE == 'qualify'
         env: {EXCHANGE_IDENTITY: '${{ secrets.EXCHANGE_IDENTITY }}'}
-        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input "$RUNNER_TEMP/reference.tar.xz.age" --output "$RUNNER_TEMP/reference"
+        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input exchange/reference.tar.xz.age --output "$RUNNER_TEMP/reference"
       - name: Dependencies, support tests and pinned provisioning
         if: env.MODE == 'qualify'
         run: |
