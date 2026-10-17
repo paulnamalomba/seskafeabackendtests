@@ -1,9 +1,11 @@
 """Archive CI outputs and encrypt them to the owner's age recipient.
 
-Usage: python ci/seal.py --name NAME --output DIR [--base DIR] PATH...
+Usage: python ci/seal.py --name NAME --output DIR [--base DIR] [--recipient-file FILE] PATH...
 
 Writes DIR/NAME.tar.xz.age. Only the holder of the matching age identity can read
-it; the job itself can encrypt but never decrypt. PATH entries that do not exist
+it; the job itself can encrypt but never decrypt. The default recipient is the
+owner (ci/results.recipient). ci/exchange.recipient seals data that later jobs
+of the same workflow decrypt with the EXCHANGE_IDENTITY secret (ci/unseal.py). PATH entries that do not exist
 are skipped, so the seal step can run after a failure. The archive carries
 MANIFEST.json, with every file's size and SHA-256, for integrity checks after
 decryption. The pinned age binary for this platform is downloaded and verified
@@ -69,6 +71,7 @@ def Main():
     parser.add_argument('--name', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--base', type=Path, default=Path('.'))
+    parser.add_argument('--recipient-file', type=Path, default=HERE / 'results.recipient')
     parser.add_argument('paths', nargs='+')
     args = parser.parse_args()
     base = args.base.resolve()
@@ -98,7 +101,8 @@ def Main():
                     files=[dict(path=Arcname(path), bytes=path.stat().st_size, sha256=Sha256(path)) for path in files])
     args.output.mkdir(parents=True, exist_ok=True)
     archive = args.output / f'{args.name}.tar.xz'
-    with tarfile.open(archive, 'w:xz', preset=1) as stream:
+    # PETSc's arch-*/lib/petsc/conf/configure.log is a symlink; store link targets as regular files.
+    with tarfile.open(archive, 'w:xz', preset=1, dereference=True) as stream:
         data = json.dumps(manifest, indent=2).encode('utf-8')
         info = tarfile.TarInfo('MANIFEST.json')
         info.size = len(data)
@@ -106,7 +110,7 @@ def Main():
         for path in files:
             stream.add(path, arcname=Arcname(path), recursive=False)
     sealed = archive.with_name(archive.name + '.age')
-    recipient = HERE / 'results.recipient'
+    recipient = args.recipient_file
     result = subprocess.run([str(Age()), '-R', str(recipient), '-o', str(sealed), str(archive)], capture_output=True)
     archive.unlink()
     if result.returncode:

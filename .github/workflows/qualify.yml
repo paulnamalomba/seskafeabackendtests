@@ -1,11 +1,24 @@
-# Hosted Windows/macOS qualification of a private commit, without publishing it.
+# Hosted Linux/Windows/macOS qualification of a private commit, without publishing it.
 #
 # The private source is checked out at run time with a read-only deploy key. Every
 # command that sees it runs through ci/guard.py, so the public log only shows step
-# names and STAGE status lines. All outputs leave the runner encrypted to the
-# owner's age recipient (ci/results.recipient). scrub.yml then audits this run's
-# logs for private source text and deletes them. mode=canary runs the log
-# self-check without the private source.
+# names and STAGE status lines. Results for the owner leave the runner encrypted to
+# ci/results.recipient. Data that later jobs need (the Linux reference) is encrypted
+# to ci/exchange.recipient and decrypted with the EXCHANGE_IDENTITY secret.
+# scrub.yml audits this run's logs for private source text and deletes them.
+#
+# tier sets the cost (backend tools/ci/Qualify.py):
+# - commit: small cases against a reused PETSc stack; every commit.
+# - engine: every case and both solver providers against a reused stack; engine
+#   changes and acceptance candidates.
+# - stack:  rebuild the PETSc stack and the reference from source; toolchain,
+#   PETSc, MPI or dependency pin changes.
+# PETSc stacks are cached per runner image, platform, profile and PETSc lock commit,
+# and the reference per engine source identity, case catalogue and PETSc commit, so
+# commit and engine runs build neither unless their inputs changed. Windows and macOS
+# compare every field with the reference on the runner; a passing run uploads only
+# summaries, hashes and logs. mode=canary runs the log self-check without the
+# private source.
 name: qualify
 
 on:
@@ -19,6 +32,10 @@ on:
         type: choice
         options: [all, windows, macos]
         default: all
+      tier:
+        type: choice
+        options: [commit, engine, stack]
+        default: commit
       mode:
         type: choice
         options: [canary, qualify]
@@ -38,18 +55,111 @@ jobs:
     env:
       BACKEND_REF: ${{ inputs.backend_ref }}
       MODE: ${{ inputs.mode }}
+      TIER: ${{ inputs.tier }}
     steps:
       - name: Validate inputs and record the run identity
         run: |
           [[ "$BACKEND_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'backend_ref must be a full 40-character commit SHA'; exit 1; }
           mkdir -p identity
-          printf '{"run_id": "%s", "run_attempt": "%s", "mode": "%s", "backend_ref": "%s", "harness_commit": "%s"}\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$MODE" "$BACKEND_REF" "$GITHUB_SHA" > identity/run-identity.json
+          printf '{"run_id": "%s", "run_attempt": "%s", "mode": "%s", "tier": "%s", "backend_ref": "%s", "harness_commit": "%s"}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$MODE" "$TIER" "$BACKEND_REF" "$GITHUB_SHA" > identity/run-identity.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with: {name: run-identity, path: identity/run-identity.json, retention-days: 7, if-no-files-found: error}
 
-  windows:
+  linux:
     needs: identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      MODE: ${{ inputs.mode }}
+      TIER: ${{ inputs.tier }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {path: harness, persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: 3.13.5}
+      - name: Prepare the guard log directory
+        run: echo "GUARD_LOG_DIR=$RUNNER_TEMP/guard-logs" >> "$GITHUB_ENV"
+      - name: Canary - guarded compile (every run)
+        env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
+        run: python harness/ci/canary.py guarded
+      - name: Private checkout
+        if: env.MODE == 'qualify'
+        env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ inputs.backend_ref }}'}
+        run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path backend
+      - name: Cache keys
+        id: keys
+        if: env.MODE == 'qualify'
+        run: python harness/ci/guard.py --label cache-keys -- python harness/ci/keys.py --backend backend --platform linux-x64 --profile debug --tier "$TIER"
+      - name: Reuse the reference for this engine source
+        id: reference
+        if: env.MODE == 'qualify' && env.TIER != 'stack'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/reference.tar.xz.age
+          key: ${{ steps.keys.outputs.reference_key }}
+          restore-keys: ${{ steps.keys.outputs.reference_fallback }}
+      - name: Dependencies, support tests and pinned provisioning
+        id: provision
+        if: env.MODE == 'qualify' && steps.reference.outputs.cache-matched-key == ''
+        run: |
+          set -e
+          python harness/ci/guard.py --label pip -- python -m pip install --only-binary=:all: --require-hashes -r backend/tools/ci/requirements.txt
+          python harness/ci/guard.py --label support-preflight --cwd backend -- python tools/SupportTests.py --output artifacts/preflight-support
+          python harness/ci/guard.py --label checkout-petsc -- python backend/tools/ci/CheckoutPetsc.py --output "$RUNNER_TEMP/petsc-native"
+          python harness/ci/guard.py --label provision --cwd backend -- python tools/ci/ProvisionUnix.py --petsc-source "$RUNNER_TEMP/petsc-native" --output artifacts/provision
+      - name: Reuse the PETSc stack
+        id: stack
+        if: steps.provision.outcome == 'success' && env.TIER != 'stack'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
+      - name: Qualify and produce the reference
+        if: steps.provision.outcome == 'success'
+        env: {STACK_MATCH: '${{ steps.stack.outputs.cache-matched-key }}'}
+        run: |
+          reuse=(); [ -n "$STACK_MATCH" ] && reuse=(--reuse-stack)
+          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$RUNNER_TEMP/petsc-native" \
+            --profile debug --tier "$TIER" --stack-dir "$RUNNER_TEMP/petsc-stack" "${reuse[@]}" --retain-fields all \
+            --configure-task-limit 512 --output artifacts/qualification
+      - name: Keep the PETSc stack
+        if: success() && steps.provision.outcome == 'success' && steps.stack.outputs.cache-matched-key == ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
+      - name: Seal the reference for the comparison jobs
+        if: success() && steps.provision.outcome == 'success'
+        run: |
+          python harness/ci/seal.py --name reference --recipient-file harness/ci/exchange.recipient --output "$RUNNER_TEMP/reference-out" \
+            --base backend/artifacts/qualification regression mumps validation.json
+          mv "$RUNNER_TEMP/reference-out/reference.tar.xz.age" "$RUNNER_TEMP/reference.tar.xz.age"
+      - name: Keep the reference
+        if: success() && steps.provision.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/reference.tar.xz.age', key: '${{ steps.keys.outputs.reference_key }}'}
+      - name: Seal outputs (summaries, hashes and logs)
+        if: success()
+        run: |
+          python harness/ci/seal.py --name "linux-x64-debug-$MODE" --output "$RUNNER_TEMP/sealed" --base "$GITHUB_WORKSPACE" \
+            'backend/artifacts/qualification/**/*.json' 'backend/artifacts/qualification/**/*.xml' 'backend/artifacts/qualification/**/*.log' \
+            backend/artifacts/preflight-support 'backend/artifacts/provision/*.json' 'backend/build/**/seska-*-build.json' \
+            'backend/build/**/seska-build-binding.json' "$RUNNER_TEMP/guard-logs"
+      - name: Seal outputs (everything, after a failure)
+        if: failure() || cancelled()
+        run: |
+          python harness/ci/seal.py --name "linux-x64-debug-$MODE" --output "$RUNNER_TEMP/sealed" --base "$GITHUB_WORKSPACE" \
+            backend/artifacts/qualification backend/artifacts/preflight-support 'backend/artifacts/provision/*.json' \
+            'backend/build/**/seska-*-build.json' 'backend/build/**/seska-build-binding.json' "$RUNNER_TEMP/guard-logs" \
+            "$RUNNER_TEMP/petsc-native/configure.log" "$RUNNER_TEMP/petsc-native/arch-*/lib/petsc/conf/*.log" \
+            "$RUNNER_TEMP/petsc-native/artifacts/seskafea/**/*.log" "$RUNNER_TEMP/petsc-native/artifacts/seskafea/**/*.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: linux-x64-debug-sealed
+          path: ${{ runner.temp }}/sealed/*.age
+          retention-days: 7
+          if-no-files-found: error
+
+  windows:
+    needs: [identity, linux]
     if: inputs.targets != 'macos'
     runs-on: windows-2022
     timeout-minutes: 330
@@ -60,6 +170,7 @@ jobs:
       run: {shell: pwsh}
     env:
       MODE: ${{ inputs.mode }}
+      TIER: ${{ inputs.tier }}
       PROFILE: ${{ matrix.profile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -80,6 +191,22 @@ jobs:
         if: env.MODE == 'qualify'
         env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ inputs.backend_ref }}'}
         run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path backend
+      - name: Cache keys
+        id: keys
+        if: env.MODE == 'qualify'
+        run: python harness/ci/guard.py --label cache-keys -- python harness/ci/keys.py --backend backend --platform windows-x64 --profile $env:PROFILE --tier $env:TIER
+      - name: Linux reference
+        if: env.MODE == 'qualify'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/reference.tar.xz.age
+          key: ${{ steps.keys.outputs.reference_key }}
+          restore-keys: ${{ steps.keys.outputs.reference_fallback }}
+          fail-on-cache-miss: true
+      - name: Decrypt the reference
+        if: env.MODE == 'qualify'
+        env: {EXCHANGE_IDENTITY: '${{ secrets.EXCHANGE_IDENTITY }}'}
+        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input "$env:RUNNER_TEMP/reference.tar.xz.age" --output "$env:RUNNER_TEMP/reference"
       - name: Dependencies and pinned toolchain
         if: env.MODE == 'qualify'
         run: |
@@ -89,18 +216,31 @@ jobs:
           if ($LASTEXITCODE) { exit 1 }
           python harness/ci/guard.py --label toolchain -- python "$env:RUNNER_TEMP/petsc-native/config/native_windows/driver.py" bootstrap
           if ($LASTEXITCODE) { exit 1 }
+      - name: Reuse the PETSc stack
+        id: stack
+        if: env.MODE == 'qualify' && env.TIER != 'stack'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
       - name: Scoped MPI crash evidence
         id: mpi-diagnostics
         if: env.MODE == 'qualify'
         run: |
           python harness/ci/guard.py --label mpi-diagnostics-setup --cwd backend -- pwsh -NoProfile -File tools/ci/WindowsMpiDiagnostics.ps1 -Action Setup -Output artifacts/msmpi-diagnostics
           if ($LASTEXITCODE) { exit 1 }
-      - name: Qualify
+      - name: Qualify against the reference
         id: qualify
         if: env.MODE == 'qualify'
+        env: {STACK_MATCH: '${{ steps.stack.outputs.cache-matched-key }}'}
         run: |
-          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$env:RUNNER_TEMP/petsc-native" --profile $env:PROFILE --solver-timeout 3600 --msmpi-debug --output artifacts/qualification
+          $reuse = @(); if ($env:STACK_MATCH) { $reuse = @('--reuse-stack') }
+          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$env:RUNNER_TEMP/petsc-native" `
+            --profile $env:PROFILE --tier $env:TIER --stack-dir "$env:RUNNER_TEMP/petsc-stack" @reuse --reference "$env:RUNNER_TEMP/reference" `
+            --solver-timeout 3600 --msmpi-debug --output artifacts/qualification
           if ($LASTEXITCODE) { exit 1 }
+      - name: Keep the PETSc stack
+        if: success() && env.MODE == 'qualify' && steps.stack.outputs.cache-matched-key == ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
       - name: Repeated MPI launches after a qualification failure
         if: failure() && steps.qualify.outcome == 'failure'
         timeout-minutes: 15
@@ -131,7 +271,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    needs: identity
+    needs: [identity, linux]
     if: inputs.targets != 'windows'
     runs-on: macos-15
     timeout-minutes: 330
@@ -140,6 +280,7 @@ jobs:
       matrix: {profile: [debug, opt]}
     env:
       MODE: ${{ inputs.mode }}
+      TIER: ${{ inputs.tier }}
       PROFILE: ${{ matrix.profile }}
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: '15.0'
@@ -161,6 +302,22 @@ jobs:
         if: env.MODE == 'qualify'
         env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ inputs.backend_ref }}'}
         run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path backend
+      - name: Cache keys
+        id: keys
+        if: env.MODE == 'qualify'
+        run: python harness/ci/guard.py --label cache-keys -- python harness/ci/keys.py --backend backend --platform macos-arm64 --profile "$PROFILE" --tier "$TIER"
+      - name: Linux reference
+        if: env.MODE == 'qualify'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/reference.tar.xz.age
+          key: ${{ steps.keys.outputs.reference_key }}
+          restore-keys: ${{ steps.keys.outputs.reference_fallback }}
+          fail-on-cache-miss: true
+      - name: Decrypt the reference
+        if: env.MODE == 'qualify'
+        env: {EXCHANGE_IDENTITY: '${{ secrets.EXCHANGE_IDENTITY }}'}
+        run: python harness/ci/guard.py --label reference -- python harness/ci/unseal.py --input "$RUNNER_TEMP/reference.tar.xz.age" --output "$RUNNER_TEMP/reference"
       - name: Dependencies, support tests and pinned provisioning
         if: env.MODE == 'qualify'
         run: |
@@ -176,10 +333,23 @@ jobs:
           python harness/ci/guard.py --label runtime-check-configure --cwd backend -- cmake -S tests/native/runtime -B artifacts/runtime-check -G Ninja
           python harness/ci/guard.py --label runtime-check-build --cwd backend -- cmake --build artifacts/runtime-check --parallel 2
           python harness/ci/guard.py --label runtime-check-test --cwd backend -- ctest --test-dir artifacts/runtime-check --output-on-failure --no-tests=error --output-junit "$GITHUB_WORKSPACE/backend/artifacts/runtime-check/junit.xml"
-      - name: Qualify
+      - name: Reuse the PETSc stack
+        id: stack
+        if: env.MODE == 'qualify' && env.TIER != 'stack'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
+      - name: Qualify against the reference
         if: env.MODE == 'qualify'
+        env: {STACK_MATCH: '${{ steps.stack.outputs.cache-matched-key }}'}
         run: |
-          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$RUNNER_TEMP/petsc-native" --profile "$PROFILE" --configure-task-limit 0 --output artifacts/qualification
+          reuse=(); [ -n "$STACK_MATCH" ] && reuse=(--reuse-stack)
+          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$RUNNER_TEMP/petsc-native" \
+            --profile "$PROFILE" --tier "$TIER" --stack-dir "$RUNNER_TEMP/petsc-stack" "${reuse[@]}" --reference "$RUNNER_TEMP/reference" \
+            --configure-task-limit 0 --output artifacts/qualification
+      - name: Keep the PETSc stack
+        if: success() && env.MODE == 'qualify' && steps.stack.outputs.cache-matched-key == ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: {path: '${{ runner.temp }}/petsc-stack', key: '${{ steps.keys.outputs.stack_key }}'}
       - name: Seal outputs
         if: always()
         run: |

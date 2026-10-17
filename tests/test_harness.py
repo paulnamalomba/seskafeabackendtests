@@ -129,5 +129,52 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(report['counts']['guarded_token'], 1)
 
 
+    def test_exchange_round_trip_decrypts_only_with_the_identity_and_checks_the_manifest(self):
+        seal = self.Run(CI / 'seal.py', '--name', 'probe', '--output', self.root / 'out', '--base', self.root, 'payload-missing')
+        self.assertEqual(seal.returncode, 0, seal.stdout)  # downloads the pinned age once
+        age = next((self.root / 'pinned-age').rglob('age.exe' if os.name == 'nt' else 'age'))
+        keygen = age.with_name('age-keygen.exe' if os.name == 'nt' else 'age-keygen')
+        identity = subprocess.run([str(keygen)], capture_output=True, text=True, check=True).stdout
+        recipient = subprocess.run([str(keygen), '-y'], input=identity, capture_output=True, text=True, check=True).stdout
+        (self.root / 'exchange.recipient').write_text(recipient, encoding='utf-8')
+        (self.root / 'reference/regression/traction-1').mkdir(parents=True)
+        (self.root / 'reference/regression/traction-1/summary.json').write_text('{"states": 3}', encoding='utf-8')
+        (self.root / 'reference/validation.json').write_text('{}', encoding='utf-8')
+        sealed = self.Run(CI / 'seal.py', '--name', 'reference', '--recipient-file', self.root / 'exchange.recipient',
+                          '--output', self.root / 'out', '--base', self.root / 'reference', 'regression', 'validation.json')
+        self.assertEqual(sealed.returncode, 0, sealed.stdout)
+        archive = self.root / 'out/reference.tar.xz.age'
+        self.environment['EXCHANGE_IDENTITY'] = identity
+        opened = self.Run(CI / 'unseal.py', '--input', archive, '--output', self.root / 'restored')
+        self.assertEqual(opened.returncode, 0, opened.stdout)
+        self.assertEqual((self.root / 'restored/regression/traction-1/summary.json').read_text(encoding='utf-8'), '{"states": 3}')
+        self.assertNotIn('AGE-SECRET-KEY', opened.stdout + opened.stderr)
+        self.environment['EXCHANGE_IDENTITY'] = subprocess.run([str(keygen)], capture_output=True, text=True, check=True).stdout
+        wrong = self.Run(CI / 'unseal.py', '--input', archive, '--output', self.root / 'wrong')
+        self.assertEqual(wrong.returncode, 1, wrong.stdout)
+        self.assertFalse((self.root / 'wrong').exists())
+
+    def test_cache_keys_follow_the_pin_source_catalogue_and_tier(self):
+        backend = self.root / 'backend'
+        (backend / 'tools').mkdir(parents=True)
+        (backend / 'cmake').mkdir()
+        (backend / 'tests/fixtures').mkdir(parents=True)
+        (backend / 'tools/SourceEvidence.py').write_text(
+            "def Identity(root):\n    return dict(source_tree_sha256='5' * 64)\n", encoding='utf-8')
+        (backend / 'cmake/DependencyLock.json').write_text('{"petsc_commit": "' + 'p' * 40 + '"}', encoding='utf-8')
+        (backend / 'tests/fixtures/cases.json').write_text('{"cases": []}', encoding='utf-8')
+        sys.path.insert(0, str(CI))
+        import keys
+        commit = keys.Keys(backend, 'windows-x64', 'debug', 'commit', 'win22', '77')
+        engine = keys.Keys(backend, 'macos-arm64', 'opt', 'engine', 'macos15', '77')
+        stack = keys.Keys(backend, 'linux-x64', 'debug', 'stack', 'ubuntu24', '77')
+        self.assertEqual(commit['stack_key'], 'stack-v1-win22-windows-x64-debug-' + 'p' * 40)
+        self.assertTrue(commit['reference_key'].endswith('-commit'))
+        self.assertEqual(commit['reference_fallback'], engine['reference_key'])
+        self.assertTrue(engine['reference_key'].endswith('-full'))
+        self.assertTrue(stack['reference_key'].endswith('-full-run77'))
+        self.assertEqual(len({commit['reference_key'].rsplit('-', 1)[0], engine['reference_key'].rsplit('-', 1)[0]}), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

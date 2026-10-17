@@ -6,6 +6,7 @@ A CI harness for a private project. This repository holds no product source code
 - `ci/guard.py` runs every command that can see the private source. It writes the command's output to files and prints only a one-line stage status, so job logs contain no source text.
 - All outputs are encrypted with [age](https://github.com/FiloSottile/age) to the owner's public recipient (`ci/results.recipient`) before upload. The runner can encrypt but cannot decrypt.
 - The `scrub` workflow checks each finished run's logs for private source text and canary tokens, uploads an encrypted report, and then deletes the logs.
+- `tier` sets the cost: `commit` runs the small cases, `engine` every case, both against cached PETSc stacks; `stack` rebuilds the PETSc stacks and the Linux reference from source. Windows and macOS compare every field with the Linux reference on the runner, so a passing run uploads only summaries, hashes and logs.
 - `mode=canary` is the log self-check. A canary run proves the guard hides output and that the audit detects a deliberately planted leak.
 
 Pull requests and issues are not accepted.
