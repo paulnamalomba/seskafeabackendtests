@@ -1,0 +1,201 @@
+# Hosted Windows/macOS qualification of a private commit, without publishing it.
+#
+# The private source is checked out at run time with a read-only deploy key. Every
+# command that sees it runs through ci/guard.py, so the public log only shows step
+# names and STAGE status lines. All outputs leave the runner encrypted to the
+# owner's age recipient (ci/results.recipient). scrub.yml then audits this run's
+# logs for private source text and deletes them. mode=canary runs the log
+# self-check without the private source.
+name: qualify
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: Full 40-character private backend commit SHA (ignored in canary mode)
+        required: true
+        default: '0000000000000000000000000000000000000000'
+      targets:
+        type: choice
+        options: [all, windows, macos]
+        default: all
+      mode:
+        type: choice
+        options: [canary, qualify]
+        default: canary
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BACKEND_REF: ${{ inputs.backend_ref }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Validate inputs and record the run identity
+        run: |
+          [[ "$BACKEND_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'backend_ref must be a full 40-character commit SHA'; exit 1; }
+          mkdir -p identity
+          printf '{"run_id": "%s", "run_attempt": "%s", "mode": "%s", "backend_ref": "%s", "harness_commit": "%s"}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$MODE" "$BACKEND_REF" "$GITHUB_SHA" > identity/run-identity.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with: {name: run-identity, path: identity/run-identity.json, retention-days: 7, if-no-files-found: error}
+
+  windows:
+    needs: identity
+    if: inputs.targets != 'macos'
+    runs-on: windows-2022
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: {profile: [debug, opt]}
+    defaults:
+      run: {shell: pwsh}
+    env:
+      MODE: ${{ inputs.mode }}
+      PROFILE: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {path: harness, persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: 3.13.5}
+      - name: Prepare the guard log directory
+        run: |
+          "GUARD_LOG_DIR=$env:RUNNER_TEMP\guard-logs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Canary - guarded compile
+        if: env.MODE == 'canary'
+        env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
+        run: python harness/ci/canary.py guarded
+      - name: Canary - planted unguarded line (sensitivity control)
+        if: env.MODE == 'canary' && matrix.profile == 'debug'
+        env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
+        run: python harness/ci/canary.py planted
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.MODE == 'qualify'
+        with:
+          repository: paulnamalomba/seskafeabackend
+          ref: ${{ inputs.backend_ref }}
+          path: backend
+          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Dependencies and pinned toolchain
+        if: env.MODE == 'qualify'
+        run: |
+          python harness/ci/guard.py --label pip -- python -m pip install --only-binary=:all: --require-hashes -r backend/tools/ci/requirements.txt
+          if ($LASTEXITCODE) { exit 1 }
+          python harness/ci/guard.py --label checkout-petsc -- python backend/tools/ci/CheckoutPetsc.py --output "$env:RUNNER_TEMP/petsc-native"
+          if ($LASTEXITCODE) { exit 1 }
+          python harness/ci/guard.py --label toolchain -- python "$env:RUNNER_TEMP/petsc-native/config/native_windows/driver.py" bootstrap
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Scoped MPI crash evidence
+        id: mpi-diagnostics
+        if: env.MODE == 'qualify'
+        run: |
+          python harness/ci/guard.py --label mpi-diagnostics-setup --cwd backend -- pwsh -NoProfile -File tools/ci/WindowsMpiDiagnostics.ps1 -Action Setup -Output artifacts/msmpi-diagnostics
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Qualify
+        id: qualify
+        if: env.MODE == 'qualify'
+        run: |
+          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$env:RUNNER_TEMP/petsc-native" --profile $env:PROFILE --solver-timeout 3600 --msmpi-debug --output artifacts/qualification
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Repeated MPI launches after a qualification failure
+        if: failure() && steps.qualify.outcome == 'failure'
+        timeout-minutes: 15
+        run: |
+          python harness/ci/guard.py --label probe-mpi --cwd backend -- python tools/ci/ProbeMpi.py --petsc-source "$env:RUNNER_TEMP/petsc-native" --profile $env:PROFILE --output artifacts/msmpi-diagnostics/repeated-launches
+      - name: Collect crash events and restore diagnostic settings
+        if: always() && steps.mpi-diagnostics.outcome != 'skipped'
+        run: |
+          python harness/ci/guard.py --label mpi-diagnostics-collect --cwd backend -- pwsh -NoProfile -File tools/ci/WindowsMpiDiagnostics.ps1 -Action Collect -Output artifacts/msmpi-diagnostics
+      - name: Seal outputs
+        if: always()
+        run: |
+          python harness/ci/seal.py --name "windows-x64-$env:PROFILE-$env:MODE" --output "$env:RUNNER_TEMP/sealed" --base "$env:GITHUB_WORKSPACE" `
+            backend/artifacts 'backend/build/*/seska-*.json' "$env:RUNNER_TEMP/guard-logs" `
+            "$env:RUNNER_TEMP/petsc-native/configure.log" "$env:RUNNER_TEMP/petsc-native/arch-mswin-icx-ifx-msmpi-$env:PROFILE/native-evidence" `
+            "$env:LOCALAPPDATA/SESKAFEA/toolchain-cache/logs"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: windows-x64-${{ matrix.profile }}-sealed
+          path: ${{ runner.temp }}/sealed/*.age
+          retention-days: 7
+          if-no-files-found: error
+
+  macos:
+    needs: identity
+    if: inputs.targets != 'windows'
+    runs-on: macos-15
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: {profile: [debug, opt]}
+    env:
+      MODE: ${{ inputs.mode }}
+      PROFILE: ${{ matrix.profile }}
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {path: harness, persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: 3.13.5}
+      - name: Prepare the guard log directory
+        run: echo "GUARD_LOG_DIR=$RUNNER_TEMP/guard-logs" >> "$GITHUB_ENV"
+      - name: Canary - guarded compile
+        if: env.MODE == 'canary'
+        env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
+        run: python harness/ci/canary.py guarded
+      - name: Canary - planted unguarded line (sensitivity control)
+        if: env.MODE == 'canary' && matrix.profile == 'debug'
+        env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
+        run: python harness/ci/canary.py planted
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.MODE == 'qualify'
+        with:
+          repository: paulnamalomba/seskafeabackend
+          ref: ${{ inputs.backend_ref }}
+          path: backend
+          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Dependencies, support tests and pinned provisioning
+        if: env.MODE == 'qualify'
+        run: |
+          set -e
+          python harness/ci/guard.py --label pip -- python -m pip install --only-binary=:all: --require-hashes -r backend/tools/ci/requirements.txt
+          python harness/ci/guard.py --label support-preflight --cwd backend -- python tools/SupportTests.py --output artifacts/preflight-support
+          python harness/ci/guard.py --label checkout-petsc -- python backend/tools/ci/CheckoutPetsc.py --output "$RUNNER_TEMP/petsc-native"
+          python harness/ci/guard.py --label provision --cwd backend -- python tools/ci/ProvisionUnix.py --petsc-source "$RUNNER_TEMP/petsc-native" --output artifacts/provision
+      - name: Native macOS process ownership check
+        if: env.MODE == 'qualify'
+        run: |
+          set -e
+          python harness/ci/guard.py --label runtime-check-configure --cwd backend -- cmake -S tests/native/runtime -B artifacts/runtime-check -G Ninja
+          python harness/ci/guard.py --label runtime-check-build --cwd backend -- cmake --build artifacts/runtime-check --parallel 2
+          python harness/ci/guard.py --label runtime-check-test --cwd backend -- ctest --test-dir artifacts/runtime-check --output-on-failure --no-tests=error --output-junit "$GITHUB_WORKSPACE/backend/artifacts/runtime-check/junit.xml"
+      - name: Qualify
+        if: env.MODE == 'qualify'
+        run: |
+          python harness/ci/guard.py --label qualify --cwd backend -- python tools/ci/Qualify.py --petsc-source "$RUNNER_TEMP/petsc-native" --profile "$PROFILE" --configure-task-limit 0 --output artifacts/qualification
+      - name: Seal outputs
+        if: always()
+        run: |
+          python harness/ci/seal.py --name "macos-arm64-$PROFILE-$MODE" --output "$RUNNER_TEMP/sealed" --base "$GITHUB_WORKSPACE" \
+            backend/artifacts 'backend/build/*/seska-*.json' "$RUNNER_TEMP/guard-logs" \
+            "$RUNNER_TEMP/petsc-native/configure.log" "$RUNNER_TEMP/petsc-native/arch-*/lib/petsc/conf/*.log"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: macos-arm64-${{ matrix.profile }}-sealed
+          path: ${{ runner.temp }}/sealed/*.age
+          retention-days: 7
+          if-no-files-found: error

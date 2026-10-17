@@ -1,0 +1,82 @@
+# Audit every finished qualify run's public logs, then delete them.
+#
+# ci/audit.py checks each log line against a salted hash set of the private
+# source's text lines (fetched with the read-only deploy key) and against the
+# run's canary tokens. The encrypted report is uploaded; the logs are deleted
+# whatever the outcome. A failed scrub run means the audit found something, or
+# could not complete, and needs the owner's attention.
+name: scrub
+
+on:
+  workflow_run:
+    workflows: [qualify]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  scrub:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {path: harness, persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: 3.13.5}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        id: identity
+        continue-on-error: true
+        with: {name: run-identity, path: identity, run-id: '${{ github.event.workflow_run.id }}', github-token: '${{ github.token }}'}
+      - name: Read the run identity
+        id: run
+        run: |
+          mode=qualify; ref=''
+          if [ -f identity/run-identity.json ]; then
+            mode=$(python -c "import json;print(json.load(open('identity/run-identity.json'))['mode'])")
+            ref=$(python -c "import json;print(json.load(open('identity/run-identity.json'))['backend_ref'])")
+          fi
+          [[ "$mode" =~ ^(canary|qualify)$ ]] || mode=qualify
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || ref=''
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        id: source
+        if: steps.run.outputs.ref != '' && steps.run.outputs.mode == 'qualify'
+        with:
+          repository: paulnamalomba/seskafeabackend
+          ref: ${{ steps.run.outputs.ref }}
+          path: source
+          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Download the run logs
+        run: gh api "repos/$REPO/actions/runs/$RUN_ID/logs" > logs.zip
+      - name: Audit
+        id: audit
+        continue-on-error: true
+        env:
+          CANARY_KEY: '${{ secrets.CANARY_KEY }}'
+          MODE: ${{ steps.run.outputs.mode }}
+        run: |
+          source=()
+          [ -d source ] && source=(--source source)
+          python harness/ci/audit.py --run-id "$RUN_ID" --mode "$MODE" --logs logs.zip --report report.json "${source[@]}"
+      - name: Seal the audit report
+        if: always()
+        run: python harness/ci/seal.py --name "audit-$RUN_ID" --output sealed --base . report.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with: {name: audit-sealed, path: sealed/*.age, retention-days: 7, if-no-files-found: warn}
+      - name: Delete the run logs
+        if: always()
+        run: gh api -X DELETE "repos/$REPO/actions/runs/$RUN_ID/logs" && echo "LOGS deleted run=$RUN_ID"
+      - name: Report the audit outcome
+        if: steps.audit.outcome != 'success'
+        run: |
+          echo 'The audit failed or could not complete; the logs were deleted. Decrypt the audit report locally.'
+          exit 1

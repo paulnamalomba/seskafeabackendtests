@@ -1,0 +1,8 @@
+__pycache__/
+*.age
+*.tar.xz
+*.agekey
+identity/
+sealed/
+logs.zip
+report.json

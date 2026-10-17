@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "age": {
+    "version": "v1.3.2",
+    "source": "https://github.com/FiloSottile/age/releases/tag/v1.3.2",
+    "pinned": "2026-10-17, SHA-256 of the release archives as downloaded over HTTPS from the GitHub release (trust on first use); the release's .proof transparency files were not verified",
+    "archives": {
+      "windows-x64": {
+        "url": "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-windows-amd64.zip",
+        "sha256": "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7",
+        "binary": "age/age.exe"
+      },
+      "macos-arm64": {
+        "url": "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-darwin-arm64.tar.gz",
+        "sha256": "e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5",
+        "binary": "age/age"
+      },
+      "linux-x64": {
+        "url": "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz",
+        "sha256": "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10",
+        "binary": "age/age"
+      }
+    }
+  }
+}
