@@ -20,7 +20,8 @@ the log file, line number and matched text, so a hit can be triaged locally
 after decryption. The console gets one status line with counts only.
 
 Expectations:
-- qualify: no source text, canary token or canary line.
+- qualify: an indexed private checkout, and no source text, canary token or
+  canary line.
 - canary: the guarded token absent; the planted token and planted line present
   (the sensitivity control); no private source text.
 Exit status 0 when the expectations hold, otherwise 1.
@@ -130,16 +131,19 @@ def Main():
                         found.setdefault('canary_line', piece)
                 for kind, piece in found.items():
                     hits[kind].append(dict(where, text=piece))
+    # Fail closed: a qualify audit without an indexed private checkout proves nothing.
+    sourceChecked = bool(args.source) and args.source.is_dir() and len(source) > 0
     if args.mode == 'canary':
         passed = not hits['source_text'] and not hits['guarded_token'] and hits['planted_token'] and hits['canary_line']
     else:
-        passed = not any(hits.values())
+        passed = sourceChecked and not any(hits.values())
     report = dict(run_id=args.run_id, mode=args.mode, log_files=files, source_pieces_indexed=len(source),
-                  public_pieces_excluded=len(public), source_checked=bool(args.source),
+                  public_pieces_excluded=len(public), source_checked=sourceChecked,
                   counts={key: len(value) for key, value in hits.items()}, hits=hits, passed=bool(passed))
     args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     counts = ' '.join(f'{key}={len(value)}' for key, value in hits.items())
-    print(f'AUDIT mode={args.mode} log_files={files} source_pieces_indexed={len(source)} {counts} {"PASS" if passed else "FAIL"}',
+    print(f'AUDIT mode={args.mode} log_files={files} source_checked={sourceChecked} source_pieces_indexed={len(source)} {counts} '
+          f'{"PASS" if passed else "FAIL"}',
           flush=True)
     return 0 if passed else 1
 

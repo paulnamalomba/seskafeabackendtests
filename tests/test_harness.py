@@ -95,6 +95,23 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(report['counts']['source_text'], 1)
                 self.assertNotIn('privateStiffnessFactor', result.stdout)
 
+    def test_qualify_audit_fails_closed_without_the_private_source(self):
+        result, report = self.Audit('qualify', ['STAGE qualify PASS exit=0'], source=False)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(report['source_checked'])
+
+    def test_private_checkout_refuses_a_partial_ref_and_a_missing_key(self):
+        environment = dict(self.environment)
+        environment.pop('BACKEND_DEPLOY_KEY', None)
+        for ref, key in (('abc', 'x'), ('a' * 40, None)):
+            env = dict(environment, BACKEND_REF=ref)
+            if key:
+                env['BACKEND_DEPLOY_KEY'] = '-----BEGIN OPENSSH PRIVATE KEY-----'
+            result = subprocess.run([sys.executable, str(CI / 'private_checkout.py'), '--path', str(self.root / 'clone')],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertFalse((self.root / 'clone').exists())
+
     def test_audit_ignores_text_that_is_public_in_this_harness(self):
         result, report = self.Audit('qualify', ['Run python harness/ci/guard.py --label pip -- python -m pip install --only-binary=:all:'])
         self.assertEqual(result.returncode, 0, result.stdout)

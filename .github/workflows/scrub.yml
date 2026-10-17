@@ -45,15 +45,11 @@ jobs:
           [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || ref=''
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        id: source
+      - name: Private checkout for the source index
         if: steps.run.outputs.ref != '' && steps.run.outputs.mode == 'qualify'
-        with:
-          repository: paulnamalomba/seskafeabackend
-          ref: ${{ steps.run.outputs.ref }}
-          path: source
-          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
-          persist-credentials: false
+        continue-on-error: true
+        env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ steps.run.outputs.ref }}'}
+        run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path source
       - name: Download the run logs
         run: gh api "repos/$REPO/actions/runs/$RUN_ID/logs" > logs.zip
       - name: Audit
@@ -64,7 +60,7 @@ jobs:
           MODE: ${{ steps.run.outputs.mode }}
         run: |
           source=()
-          [ -d source ] && source=(--source source)
+          [ "$MODE" = qualify ] && source=(--source source)
           python harness/ci/audit.py --run-id "$RUN_ID" --mode "$MODE" --logs logs.zip --report report.json "${source[@]}"
       - name: Seal the audit report
         if: always()

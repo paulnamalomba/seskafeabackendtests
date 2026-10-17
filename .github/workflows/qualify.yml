@@ -69,22 +69,17 @@ jobs:
       - name: Prepare the guard log directory
         run: |
           "GUARD_LOG_DIR=$env:RUNNER_TEMP\guard-logs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Canary - guarded compile
-        if: env.MODE == 'canary'
+      - name: Canary - guarded compile (every run)
         env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
         run: python harness/ci/canary.py guarded
       - name: Canary - planted unguarded line (sensitivity control)
         if: env.MODE == 'canary' && matrix.profile == 'debug'
         env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
         run: python harness/ci/canary.py planted
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Private checkout
         if: env.MODE == 'qualify'
-        with:
-          repository: paulnamalomba/seskafeabackend
-          ref: ${{ inputs.backend_ref }}
-          path: backend
-          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
-          persist-credentials: false
+        env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ inputs.backend_ref }}'}
+        run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path backend
       - name: Dependencies and pinned toolchain
         if: env.MODE == 'qualify'
         run: |
@@ -119,8 +114,12 @@ jobs:
         if: always()
         run: |
           python harness/ci/seal.py --name "windows-x64-$env:PROFILE-$env:MODE" --output "$env:RUNNER_TEMP/sealed" --base "$env:GITHUB_WORKSPACE" `
-            backend/artifacts 'backend/build/*/seska-*.json' "$env:RUNNER_TEMP/guard-logs" `
-            "$env:RUNNER_TEMP/petsc-native/configure.log" "$env:RUNNER_TEMP/petsc-native/arch-mswin-icx-ifx-msmpi-$env:PROFILE/native-evidence" `
+            backend/artifacts/qualification/regression backend/artifacts/qualification/mumps `
+            'backend/artifacts/qualification/**/*.json' 'backend/artifacts/qualification/**/*.json.gz' `
+            'backend/artifacts/qualification/**/*.xml' 'backend/artifacts/qualification/**/*.log' 'backend/artifacts/qualification/**/*.log.gz' `
+            backend/artifacts/native backend/artifacts/msmpi-diagnostics `
+            'backend/build/**/seska-*-build.json' 'backend/build/**/seska-build-binding.json' "$env:RUNNER_TEMP/guard-logs" `
+            "$env:RUNNER_TEMP/petsc-native/configure.log" "$env:RUNNER_TEMP/petsc-native/arch-*/native-evidence" `
             "$env:LOCALAPPDATA/SESKAFEA/toolchain-cache/logs"
           if ($LASTEXITCODE) { exit 1 }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -151,22 +150,17 @@ jobs:
         with: {python-version: 3.13.5}
       - name: Prepare the guard log directory
         run: echo "GUARD_LOG_DIR=$RUNNER_TEMP/guard-logs" >> "$GITHUB_ENV"
-      - name: Canary - guarded compile
-        if: env.MODE == 'canary'
+      - name: Canary - guarded compile (every run)
         env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
         run: python harness/ci/canary.py guarded
       - name: Canary - planted unguarded line (sensitivity control)
         if: env.MODE == 'canary' && matrix.profile == 'debug'
         env: {CANARY_KEY: '${{ secrets.CANARY_KEY }}'}
         run: python harness/ci/canary.py planted
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Private checkout
         if: env.MODE == 'qualify'
-        with:
-          repository: paulnamalomba/seskafeabackend
-          ref: ${{ inputs.backend_ref }}
-          path: backend
-          ssh-key: ${{ secrets.BACKEND_DEPLOY_KEY }}
-          persist-credentials: false
+        env: {BACKEND_DEPLOY_KEY: '${{ secrets.BACKEND_DEPLOY_KEY }}', BACKEND_REF: '${{ inputs.backend_ref }}'}
+        run: python harness/ci/guard.py --label private-checkout -- python harness/ci/private_checkout.py --path backend
       - name: Dependencies, support tests and pinned provisioning
         if: env.MODE == 'qualify'
         run: |
@@ -190,8 +184,14 @@ jobs:
         if: always()
         run: |
           python harness/ci/seal.py --name "macos-arm64-$PROFILE-$MODE" --output "$RUNNER_TEMP/sealed" --base "$GITHUB_WORKSPACE" \
-            backend/artifacts 'backend/build/*/seska-*.json' "$RUNNER_TEMP/guard-logs" \
-            "$RUNNER_TEMP/petsc-native/configure.log" "$RUNNER_TEMP/petsc-native/arch-*/lib/petsc/conf/*.log"
+            backend/artifacts/qualification/regression backend/artifacts/qualification/mumps \
+            'backend/artifacts/qualification/**/*.json' 'backend/artifacts/qualification/**/*.json.gz' \
+            'backend/artifacts/qualification/**/*.xml' 'backend/artifacts/qualification/**/*.log' 'backend/artifacts/qualification/**/*.log.gz' \
+            backend/artifacts/native backend/artifacts/preflight-support 'backend/artifacts/provision/*.json' 'backend/artifacts/provision/*.sources' \
+            backend/artifacts/runtime-check/junit.xml backend/artifacts/runtime-check/Testing/Temporary/LastTest.log \
+            'backend/build/**/seska-*-build.json' 'backend/build/**/seska-build-binding.json' "$RUNNER_TEMP/guard-logs" \
+            "$RUNNER_TEMP/petsc-native/configure.log" "$RUNNER_TEMP/petsc-native/arch-*/lib/petsc/conf/*.log" \
+            "$RUNNER_TEMP/petsc-native/artifacts/seskafea/**/*.log" "$RUNNER_TEMP/petsc-native/artifacts/seskafea/**/*.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
